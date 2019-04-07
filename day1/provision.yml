@@ -1,0 +1,161 @@
+- hosts: all
+  
+  become: yes
+  
+  tasks:
+  - name: Install needed packages
+    yum:
+      name:
+        - yum-utils
+        - lvm2
+        - jq
+        - ntp
+        - bind-utils
+        - epel-release
+        - net-tools
+        - deltarpm
+      state: latest
+
+  - name: Add repo for Docker
+    get_url:
+       dest: /etc/yum.repos.d/docker-ce.repo
+       url:  https://download.docker.com/linux/centos/docker-ce.repo
+
+  - name: Enable Docker-ce-edge
+    ini_file:
+      path: /etc/yum.repos.d/docker-ce.repo
+      section: 'docker-ce-edge'
+      option: enabled
+      value: 0
+    
+  - name: Install Docker
+    package:
+      name: docker-ce
+      state: latest
+    
+  - name: Start and Enabled docker.service
+    service:
+      name: docker
+      state: started
+      enabled: yes
+      
+  - name: Add user devops to docker group
+    user:
+      name: devops
+      groups: docker
+      append: yes
+    
+  - name: Add user vagrant to docker group
+    user:
+      name: vagrant
+      groups: docker
+      append: yes
+    
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: swap
+      fstype: swap
+      state: absent
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Disabled SELinux 
+    lineinfile:
+      path: /etc/sysconfig/selinux
+      state: present
+      create: yes
+      line:  "SELINUX=disabled"
+
+  - name: Create and input information to kubernetes.repo
+    blockinfile:
+      state: present
+      create: yes
+      path: /etc/yum.repos.d/kubernetes.repo
+      block: |
+        [kubernetes]
+        name=Kubernetes
+        baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+        enabled=1
+        gpgcheck=1
+        repo_gpgcheck=1
+        gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+        exclude=kube*
+
+  - name: Change SELINUX in /etc/selinux/config
+    lineinfile:
+      state: present
+      create: yes
+      path: /etc/selinux/config
+      line: "SELINUX=permissive"
+
+  - name: Install Kubelet Kubeadm Kubectl
+    yum:
+      name:
+        - kubectl
+        - kubeadm
+        - kubelet
+      disable_excludes: kubernetes
+      state: latest
+  
+  - name: Enable Kubelet
+    service: 
+      name: kubelet
+      state: started
+      enabled: yes
+      
+
+  - name: Make changes /etc/sysctl.d/docker.conf
+    blockinfile:
+      path: /etc/sysctl/docker.conf
+      state: present
+      create: yes
+      block: |
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+
+  - name: Configure /proc/sys/net/bridge/bridge-nf-call-iptables
+    shell: echo '1' > /proc/sys/net/bridge/bridge-nf-call-iptables
+
+- hosts: masters
+  become: yes
+  tasks:
+  - name: Reset Kubernetes components
+    shell: kubeadm reset --force
+
+  - name: Initialize Kubernetes Cluster
+    shell: kubeadm init --pod-network-cidr 10.244.0.0/16 --apiserver-advertise-address 192.168.56.15
+  
+  - name: Create directory
+    file:
+      path: '{{ ansible_user_dir }}/.kube'
+      state: directory
+
+  - name: Copy file from /etc/kubernetes/admin.conf to ~/.kube/config
+    copy:
+      remote_src: yes
+      src: /etc/kubernetes/admin.conf
+      dest: '{{ ansible_user_dir }}/.kube/config'
+
+  - name: Apply and Patch flannel / Create token
+    shell: |
+      kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/bc79dd1505b0c8681ece4de4c0d86c5cd2643275/Documentation/kube-flannel.yml
+      kubectl patch daemonsets kube-flannel-ds-amd64 -n kube-system --patch='{"spec":{"template":{"spec":{"containers":[{"name": "kube-flannel", "args": ["--ip-masq", "--kube-subnet-mgr", "--iface='${IPETHX}'"]}]}}}}'
+      kubeadm token list | awk '{ print $1 }'| awk NR==2 > /vagrant/token
+
+- hosts: workers
+  become: yes
+  tasks:
+  - name: Reset Kubernetes components
+    shell: kubeadm reset --force
+
+  - name: Join Worker to Cluster
+    shell:
+      kubeadm join --token $(head -1 /vagrant/token) --discovery-token-unsafe-skip-ca-verification 192.168.56.15:6443 
+    
+
+
+
+
+
